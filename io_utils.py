@@ -6,7 +6,6 @@ from typing import Any, Mapping, Iterable, Union, List, Callable, Optional
 
 from tqdm.auto import tqdm
 
-
 def resolve_globs(glob_paths: Union[str, Iterable[str]]):
     """Returns filepaths corresponding to input filepath pattern(s)."""
     filepaths = []
@@ -114,3 +113,4 @@ def write_json(obj: Mapping[str, Any], filename: str, indent:int=None):
 
 def print_json(d, indent=4):
     print(json.dumps(d, indent=indent))
+    

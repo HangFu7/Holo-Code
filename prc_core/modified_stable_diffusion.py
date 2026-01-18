@@ -1,27 +1,20 @@
-
 from typing import Callable, List, Optional, Union, Any, Dict
 import copy
 import numpy as np
 import PIL
-
 import torch
-# 导入 diffusers 的核心组件
-from diffusers import StableDiffusionPipeline, DDIMScheduler, UNet2DConditionModel
+from diffusers import StableDiffusionPipeline
 from diffusers.utils import logging, BaseOutput
-from torchvision.transforms import ToPILImage
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
 
-# ================= 自定义输出类 =================
-# 继承自 BaseOutput，标准 SD 只返回 images 和 nsfw_content_detected
-# 这里增加了 init_latents，用于调试或分析生成的初始状态
 class ModifiedStableDiffusionPipelineOutput(BaseOutput):
     images: Union[List[PIL.Image.Image], np.ndarray]
     nsfw_content_detected: Optional[List[bool]]
-    init_latents: Optional[torch.FloatTensor] # [新增] 返回初始噪声 z_T
+    init_latents: Optional[torch.FloatTensor]
 
-# 继承标准的 StableDiffusionPipeline
+
 class ModifiedStableDiffusionPipeline(StableDiffusionPipeline):
     def __init__(self,
         vae,
@@ -31,11 +24,8 @@ class ModifiedStableDiffusionPipeline(StableDiffusionPipeline):
         scheduler,
         safety_checker,
         feature_extractor,
-        requires_safety_checker: bool = False,
-        image_encoder=None
+        requires_safety_checker: bool = True,
     ):
-        # 直接调用父类的初始化，没有任何改动
-        # 这一步是为了保持与标准 SD 模型的兼容性，可以加载预训练权重
         super(ModifiedStableDiffusionPipeline, self).__init__(vae,
                 text_encoder,
                 tokenizer,
@@ -43,7 +33,7 @@ class ModifiedStableDiffusionPipeline(StableDiffusionPipeline):
                 scheduler,
                 safety_checker,
                 feature_extractor,
-                image_encoder=image_encoder) ###########多了这一步
+                requires_safety_checker)
 
     @torch.no_grad()
     def __call__(
@@ -57,13 +47,11 @@ class ModifiedStableDiffusionPipeline(StableDiffusionPipeline):
         num_images_per_prompt: Optional[int] = 1,
         eta: float = 0.0,
         generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
-        latents: Optional[torch.FloatTensor] = None, # [关键] 允许直接传入我们构造好的水印噪声 z_T
+        latents: Optional[torch.FloatTensor] = None,
         output_type: Optional[str] = "pil",
         return_dict: bool = True,
         callback: Optional[Callable[[int, int, torch.FloatTensor], None]] = None,
         callback_steps: Optional[int] = 1,
-        # [新增参数] 以下三个参数用于在去噪过程中注入水印（可能是为了对比实验或特定攻击模拟）
-        # Gaussian Shading 本身主要依赖上面的 latents 参数，这里的逻辑可能是为了支持其他 Baseline 方法
         watermarking_gamma: float = None,
         watermarking_delta: float = None,
         watermarking_mask: Optional[torch.BoolTensor] = None,
@@ -123,43 +111,32 @@ class ModifiedStableDiffusionPipeline(StableDiffusionPipeline):
             (nsfw) content, according to the `safety_checker`.
         """
         # 0. Default height and width to unet
-        # 0. 设置默认长宽 (通常为 512x512)
         height = height or self.unet.config.sample_size * self.vae_scale_factor
         width = width or self.unet.config.sample_size * self.vae_scale_factor
-        self.count = 0
 
-        # 1. 检查输入参数合法性
         # 1. Check inputs. Raise error if not correct
         self.check_inputs(prompt, height, width, callback_steps)
 
-        # 2. 定义调用参数
         # 2. Define call parameters
         batch_size = 1 if isinstance(prompt, str) else len(prompt)
         device = self._execution_device
         # here `guidance_scale` is defined analog to the guidance weight `w` of equation (2)
         # of the Imagen paper: https://arxiv.org/pdf/2205.11487.pdf . `guidance_scale = 1`
         # corresponds to doing no classifier free guidance.
-        
-        # 判断是否使用 CFG (Classifier-Free Guidance)
         do_classifier_free_guidance = guidance_scale > 1.0
 
-        # 3. 编码 Prompt
-        # 将文本转换为 embedding 向量
         # 3. Encode input prompt
-        text_embeddings = self._encode_prompt(
+        text_embeddings_tuple = self.encode_prompt(
             prompt, device, num_images_per_prompt, do_classifier_free_guidance, negative_prompt
         )
-
-        # 4. 准备时间步 (Timesteps)
+        text_embeddings = torch.cat([text_embeddings_tuple[1], text_embeddings_tuple[0]])
+        
         # 4. Prepare timesteps
         self.scheduler.set_timesteps(num_inference_steps, device=device)
         timesteps = self.scheduler.timesteps
 
-        # 5. 准备 Latents (初始噪声)
-        # [关键步骤] 如果我们在调用时传入了 `latents` (即 Gaussian Shading 构造的 z_T)，
-        # 这个函数会直接使用它，而不会重新采样随机高斯噪声。
         # 5. Prepare latent variables
-        num_channels_latents = self.unet.in_channels
+        num_channels_latents = self.unet.config.in_channels
         latents = self.prepare_latents(
             batch_size * num_images_per_prompt,
             num_channels_latents,
@@ -168,86 +145,69 @@ class ModifiedStableDiffusionPipeline(StableDiffusionPipeline):
             text_embeddings.dtype,
             device,
             generator,
-            latents, # <--- 传入水印噪声
+            latents,
         )
 
-        # 备份一份初始噪声，用于返回结果
         init_latents = copy.deepcopy(latents)
 
-        # [水印掩码逻辑]
-        # 如果设置了 watermarking_gamma，则创建一个随机掩码，决定哪些像素点要在过程中被修改
         # watermarking mask
         if watermarking_gamma is not None:
             watermarking_mask = torch.rand(latents.shape, device=device) < watermarking_gamma
 
-        # 6. 准备调度器的额外参数 (如 eta)
-        # 6. Prepare extra step kwargs. TODO: Logic should ideally just be moved out of the pipeline
+        # 6. Prepare extra step kwargs.
         extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
 
-        # 7. 去噪循环 (Denoising Loop)
+        self.unet = self.unet.float()
+        latents = latents.float()
+        text_embeddings = text_embeddings.float()
+
         # 7. Denoising loop
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
-                
-                # [过程水印注入逻辑]
-                # 这是标准 SD 没有的代码。如果 mask 存在，它会在每一步去噪前，强制修改 latents 的值。
-                # 注意：Gaussian Shading 核心算法通常不使用这部分逻辑，这可能是为了实现某些 Baseline (如基于过程注入的水印)。
                 # add watermark
                 if watermarking_mask is not None:
-                    # 将被选中的位置增加一个 delta 偏移量
-                    # latents[watermarking_mask] += watermarking_delta
                     latents[watermarking_mask] += watermarking_delta * torch.sign(latents[watermarking_mask])
 
-                # 扩展 latents 以适配 CFG (复制一份用于无条件生成)
                 # expand the latents if we are doing classifier free guidance
                 latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
                 latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
 
-                # predict the noise residual # [UNet 预测] 预测噪声残差
+                # predict the noise residual
                 noise_pred = self.unet(latent_model_input, t, encoder_hidden_states=text_embeddings).sample
 
-                # perform guidance # [CFG 引导]
+                # perform guidance
                 if do_classifier_free_guidance:
                     noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
                     noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
 
                 # compute the previous noisy sample x_t -> x_t-1
-                # [调度器更新] 计算下一步的 latents (x_t -> x_t-1)
                 latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs).prev_sample
 
-                # call the callback, if provided # 更新进度条
+                # call the callback, if provided
                 if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
                     progress_bar.update()
                     if callback is not None and i % callback_steps == 0:
                         callback(i, t, latents)
 
         # 8. Post-processing
-        # 8. 后处理 (Post-processing)
-        # 将 latents 解码为像素空间图像 (使用 VAE Decoder)
         image = self.decode_latents(latents)
-        
+
         # 9. Run safety checker
-        # 9. 运行安全检查器 (NSFW Check)
         image, has_nsfw_concept = self.run_safety_checker(image, device, text_embeddings.dtype)
 
         # 10. Convert to PIL
-        # 10. 转换为 PIL 格式
         if output_type == "pil":
             image = self.numpy_to_pil(image)
 
         if not return_dict:
             return (image, has_nsfw_concept)
 
-        # 返回自定义的 Output 对象，包含了 init_latents
-        return ModifiedStableDiffusionPipelineOutput(images=image, nsfw_content_detected=has_nsfw_concept, init_latents=init_latents)
+        return ModifiedStableDiffusionPipelineOutput(images=image, nsfw_content_detected=has_nsfw_concept, init_latents=init_latents), latents
 
 
-    # [辅助函数] 解码图像
-    # 这一步是为了方便不走完整 Pipeline，只做 VAE Decode 测试时使用
     @torch.inference_mode()
     def decode_image(self, latents: torch.FloatTensor, **kwargs):
-        # 这里的 1 / 0.18215 是 SD 的缩放因子逆运算
         scaled_latents = 1 / 0.18215 * latents
         image = [
             self.vae.decode(scaled_latents[i : i + 1]).sample for i in range(len(latents))
@@ -255,29 +215,18 @@ class ModifiedStableDiffusionPipeline(StableDiffusionPipeline):
         image = torch.cat(image, dim=0)
         return image
 
-    # [辅助函数] Tensor 转 Numpy
-    # 将 [-1, 1] 的 Tensor 转换为 [0, 1] 的 Numpy 数组，格式为 (H, W, C)
     @torch.inference_mode()
     def torch_to_numpy(self, image):
         image = (image / 2 + 0.5).clamp(0, 1)
         image = image.cpu().permute(0, 2, 3, 1).numpy()
         return image
 
-    # [关键辅助函数] 获取图像的 Latents (VAE Encode)
-    # 这里的逻辑对应论文中的 z_0 = E(x)
-    # 用于在提取水印前，先把像素图片 (x) 变回潜变量 (z_0)
     @torch.inference_mode()
     def get_image_latents(self, image, sample=True, rng_generator=None):
-        # 使用 VAE 编码器
         encoding_dist = self.vae.encode(image).latent_dist
         if sample:
-            # 随机采样模式 (一般不用，除非为了增加随机性)
             encoding = encoding_dist.sample(generator=rng_generator)
         else:
-            # 确定性模式 (Mode)，直接取分布的均值
-            # 提取水印时通常使用这个，以减少噪声干扰
             encoding = encoding_dist.mode()
-            
-        # 乘以缩放因子 0.18215 (SD 的标准参数)
         latents = encoding * 0.18215
         return latents
