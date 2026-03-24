@@ -4,11 +4,15 @@ import math
 import torch
 import torch.nn.functional as F
 import numpy as np
+import time
 from scipy.stats import norm, truncnorm
 from scipy.special import betainc
 from functools import reduce
 from Crypto.Cipher import ChaCha20
 from Crypto.Random import get_random_bytes
+import reedsolo
+import galois
+from ldpc_utils import SystematicLDPC
 
 # =========================================================================
 #  Optional PRC Modules (For Baseline Comparison)
@@ -226,6 +230,150 @@ class NaiveCoder:
 # =========================================================================
 #  Holo-Code (Modified for Ablation)
 # =========================================================================
+class LDPCCoder:
+    """
+    现代 LDPC 编解码器 (完美定制 k=260, m=195, n=455)
+    """
+    def __init__(self, scale=1.0):
+        self.scale = scale
+        # K=260, M=195, N=455 (严格遵守 4/7 码率)
+        self.ldpc = SystematicLDPC(k=260, m=195, col_weight=3, max_iter=10, seed=42)
+
+    def encode(self, message_bits):
+        orig_shape = message_bits.shape  # (65, 4)
+        bits_1d = message_bits.flatten() # 260 bits
+        
+        coded_blocks, _ = self.ldpc.encode_bit_blocks(bits_1d) # 必然输出 (1, 455)
+        coded_bits = coded_blocks.flatten()
+        
+        c = np.where(coded_bits == 0, -self.scale, self.scale).astype(np.float32)
+        return c.reshape(orig_shape[0], 7)
+
+    def decode_soft(self, noisy_blocks):
+        orig_shape = noisy_blocks.shape  # (65, 7)
+        noisy_1d = noisy_blocks.flatten() # 455 floats
+        
+        # LLR 映射
+        llr = -noisy_1d 
+        decoded_bits = self.ldpc.decode_block_min_sum_llr(llr) # 返回 455 bits 的完整码字
+        msg_bits = decoded_bits[:orig_shape[0] * 4] # 取前 260 bits
+        
+        confidence = np.mean(np.abs(noisy_1d))
+        
+        # 【极速修复】：直接用 LDPC 的校验矩阵 H 计算伴随式 (Syndrome = H * c mod 2)
+        syndrome = (self.ldpc.H @ decoded_bits) % 2
+        
+        if np.all(syndrome == 0):
+            confidence += 10.0 # 完全收敛给高分，锁定网格
+            
+        return msg_bits.reshape(orig_shape[0], 4), confidence
+
+class BCHCoder:
+    """
+    现代 BCH 编解码器 (代数硬判决解码)
+    - 借用 BCH(511, 259) 截断模拟
+    """
+    def __init__(self, scale=1.0):
+        self.scale = scale
+        # 初始化 BCH(511, 259)，能纠正 29 个错误
+        self.bch = galois.BCH(511, 259)
+
+    def encode(self, message_bits):
+        orig_shape = message_bits.shape
+        bits_1d = message_bits.flatten()
+        
+        # 补齐 3 个 bit 满足 259
+        padded_msg = np.pad(bits_1d, (0, 3), 'constant')
+        gf_msg = galois.GF2(padded_msg)
+        
+        # BCH 编码出 511 bits
+        coded_gf = self.bch.encode(gf_msg)
+        coded_bits = np.asarray(coded_gf, dtype=np.uint8)
+        
+        # 截断到 448 bits 保持严格 4/7 码率公平对比
+        coded_bits_448 = coded_bits[:448]
+        
+        c = np.where(coded_bits_448 == 0, -self.scale, self.scale).astype(np.float32)
+        return c.reshape(orig_shape[0], 7)
+
+    def decode_soft(self, noisy_blocks):
+        orig_shape = noisy_blocks.shape
+        noisy_1d = noisy_blocks.flatten()
+        
+        # 硬判决
+        hard_bits = (noisy_1d > 0).astype(np.uint8)
+        confidence = np.mean(np.abs(noisy_1d))
+        
+        # 补回被截断的 bits 作为 Erasure 送入解码器
+        padded_rx = np.pad(hard_bits, (0, 511 - 448), 'constant')
+        gf_rx = galois.GF2(padded_rx)
+        
+        try:
+            # 尝试 BCH 代数解码
+            decoded_gf = self.bch.decode(gf_rx)
+            decoded_bits = np.asarray(decoded_gf, dtype=np.uint8)[:256]
+            confidence += 10.0
+            return decoded_bits.reshape(orig_shape[0], 4), confidence
+        except Exception:
+            # 【悬崖效应触发】：BCH 解码崩溃
+            failed_bits = hard_bits[:256]
+            return failed_bits.reshape(orig_shape[0], 4), confidence
+
+class RSCoder:
+    """ 
+    现代 RS 编解码器 (完美适配 hw=6, Payload=260 bits, Encoded=455 bits)
+    """
+    def __init__(self, scale=1.0):
+        self.scale = scale
+        # 33 Bytes(输入) + 24 Bytes(冗余) = 57 Bytes(输出)
+        self.rs = reedsolo.RSCodec(24)
+
+    def encode(self, message_bits):
+        orig_shape = message_bits.shape  # 必然是 (65, 4)
+        bits_1d = message_bits.flatten() # 260 bits
+        
+        # 补 4 bits 凑齐 33 Bytes (264 bits)
+        bits_padded = np.pad(bits_1d, (0, 4), 'constant')
+        msg_bytes = bytearray(np.packbits(bits_padded))
+        
+        # RS 编码得到 57 Bytes (456 bits)
+        encoded_bytes = self.rs.encode(msg_bytes)
+        encoded_bits = np.unpackbits(np.frombuffer(encoded_bytes, dtype=np.uint8))
+        
+        # 截断最后一个 padding bit，精确输出 455 bits
+        target_len = orig_shape[0] * 7  # 65 * 7 = 455
+        encoded_bits = encoded_bits[:target_len]
+        
+        c = np.where(encoded_bits == 0, -self.scale, self.scale).astype(np.float32)
+        return c.reshape(orig_shape[0], 7)
+
+    def decode_soft(self, noisy_blocks):
+        orig_shape = noisy_blocks.shape  # 必然是 (65, 7)
+        noisy_1d = noisy_blocks.flatten() # 455 floats
+        
+        # RS的致命弱点：只能硬判决
+        hard_bits = (noisy_1d > 0).astype(np.uint8)
+        confidence = np.mean(np.abs(noisy_1d))
+        
+        # 补 1 bit 凑齐 57 Bytes (456 bits) 以便解码
+        hard_bits_padded = np.pad(hard_bits, (0, 1), 'constant')
+        rx_bytes = bytearray(np.packbits(hard_bits_padded))
+        
+        try:
+            # RS 尝试解码
+            decoded_bytes, _, _ = self.rs.decode(rx_bytes)
+            decoded_bits = np.unpackbits(np.frombuffer(decoded_bytes, dtype=np.uint8))
+            
+            # 截取真实的 260 bits
+            msg_bits = decoded_bits[:orig_shape[0] * 4]
+            confidence += 10.0  # 校验成功给高分，锁定网格
+            return msg_bits.reshape(orig_shape[0], 4), confidence
+        except reedsolo.ReedSolomonError:
+            # 盲同步偏移引发【悬崖效应】，解码直接崩溃！
+            failed_bits = hard_bits[:orig_shape[0] * 4]
+            return failed_bits.reshape(orig_shape[0], 4), confidence
+
+
 
 class LatticeCoder:
     """ 高性能 Hamming(7,4) 编解码器 (原版保持不变) """
@@ -296,7 +444,7 @@ class Holo_Shading:
             self.coder = NaiveCoder()
         else:
             print(f"[{mode}] Initializing LatticeCoder (Hamming 7,4)...")
-            self.coder = LatticeCoder()
+            self.coder = LDPCCoder()
             
         self.marklength = self.capacity_bits
         
@@ -328,9 +476,20 @@ class Holo_Shading:
         z = torch.from_numpy(z).reshape(1, 4, 64, 64).half()
         return z.cuda()
 
-    def create_watermark_and_return_w(self):
-        # 1. 随机生成 Payload
-        message_bits = np.random.randint(0, 2, self.capacity_bits)
+    def create_watermark_and_return_w(self, message=None, return_stats=False):
+        # 1. 确定 Payload
+        if message is not None:
+            # 如果传了特定 message (比如十进制整数 ID)，将其转为二进制数组
+            if isinstance(message, int):
+                bin_str = format(message, f'0{self.capacity_bits}b')
+                message_bits = np.array([int(b) for b in bin_str])
+            else:
+                # 如果传入的已经是数组，直接使用
+                message_bits = np.array(message)
+        else:
+            # 兼容老代码：如果不传 message，就随机生成
+            message_bits = np.random.randint(0, 2, self.capacity_bits)
+            
         self.gt_message = message_bits
 
         # 2. Encoding (coder 已经根据 mode 替换了)
@@ -352,11 +511,17 @@ class Holo_Shading:
             # Full & Variant B: 使用 Permutation
             m_scrambled = m_ordered[self.perm_indices]
         
-        # 5. Whitening
+        # 5. Whitening (关键统计量 s)
         m_final = m_scrambled ^ self.whitening_mask
         
-        # 6. Sampling
+        # 6. Sampling (关键统计量 z_T)
         w = self.truncSampling_fast(m_final)
+        
+        # --- 新增：专门为定理 1 验证开辟的“后门” ---
+        if return_stats:
+            # 返回 w (即 z_T) 和 m_final (即 s)
+            return w, m_final
+            
         return w
 
     def attempt_decode(self, w_flat_numpy):
@@ -364,31 +529,31 @@ class Holo_Shading:
         whitening_correction = 1 - 2 * self.whitening_mask 
         w_corrected = w_flat_numpy * whitening_correction
         
-        # 2. Inverse Permutation (根据 mode 决定是否跳过)
+        # 2. Inverse Permutation
         if self.mode == 'no_holo':
             w_ordered_soft = w_corrected
         else:
             w_ordered_soft = w_corrected[self.inv_perm_indices]
         
-        # 3. Pooling
+        # 3. Pooling (最原始的均值池化)
         w_valid = w_ordered_soft[:self.used_patches * self.pixels_per_patch]
         w_reshaped = w_valid.reshape(self.num_blocks * 7, self.pixels_per_patch)
+        
+        # 没有任何花里胡哨的操作，直接取均值
         symbol_means = np.mean(w_reshaped, axis=1)
         
-        # 4. Decoding (coder 已经根据 mode 替换了)
+        # 4. Soft Decoding
         decoded_bits, confidence = self.coder.decode_soft(symbol_means.reshape(self.num_blocks, 7))
         return decoded_bits.flatten(), confidence
 
     # ... eval_watermark 和 get_tpr 保持不变 ...
     def eval_watermark(self, reversed_w):
-        # (原代码 eval_watermark 逻辑无需修改，它调用的是 attempt_decode)
-        # ... (此处省略原代码) ...
-        # 请直接保留原来的 eval_watermark 代码块
         # 统一转到 CPU 进行几何搜索，避免设备冲突
         target_tensor = reversed_w.cpu().float()
         
         best_acc = 0.0
         best_confidence = -float('inf')
+        best_decoded_bits = None  # 【新增 1】：用来保存提取出的最佳 0/1 序列
         
         # === 几何感知盲同步 (Geometry-Aware Blind Synchronization) ===
         
@@ -444,6 +609,8 @@ class Holo_Shading:
                     
                     if confidence > best_confidence:
                         best_confidence = confidence
+                        best_decoded_bits = decoded_bits # 【新增 2】：保存最佳序列
+                        
                         if self.gt_message is not None:
                             correct = np.sum(decoded_bits == self.gt_message)
                             best_acc = correct / len(self.gt_message)
@@ -451,7 +618,113 @@ class Holo_Shading:
         if best_acc >= self.tau_onebit: self.tp_onebit_count += 1
         if best_acc >= self.tau_bits: self.tp_bits_count += 1
         
-        return best_acc
+        # 【修改 3】：同时返回 best_acc 和提取出的 0/1 数组
+        return best_acc, best_decoded_bits
+
+    # ==========================================
+    # 论文测速专用代码 (Benchmark)
+    # ==========================================
+    def _sync_only(self, target_tensor):
+        """
+        纯净版盲同步网格搜索，仅用于 Benchmark 测速。
+        完全复刻 eval_watermark 的几何感知逻辑。
+        """
+        best_confidence = -1
+        
+        # 1. Scale Search Space (抗 Resize / Perspective)
+        scale_grid = [1.0]
+        scale_grid.extend(np.arange(0.9, 1.1, 0.02).tolist()) 
+        scale_grid = sorted(list(set([round(s, 2) for s in scale_grid])), key=lambda x: abs(x-1.0))
+
+        # 2. Shift Search Space (抗 Translation / Crop 对齐)
+        shift_range = 1 
+        original_h, original_w = 64, 64
+
+        for scale in scale_grid:
+            # --- Geometric Transform: Scale ---
+            if scale != 1.0:
+                # interpolate 需要 4D 输入 (N,C,H,W)
+                w_rescaled = F.interpolate(
+                    target_tensor, 
+                    scale_factor=scale, 
+                    mode='bilinear', 
+                    align_corners=False
+                )
+            else:
+                w_rescaled = target_tensor
+
+            # --- Geometric Alignment: Padding/Cropping ---
+            curr_h, curr_w = w_rescaled.shape[2], w_rescaled.shape[3]
+            canvas = torch.zeros(1, 4, original_h, original_w)
+            
+            # Center alignment logic
+            dst_y = max(0, (original_h - curr_h) // 2)
+            dst_x = max(0, (original_w - curr_w) // 2)
+            src_y = max(0, (curr_h - original_h) // 2)
+            src_x = max(0, (curr_w - original_w) // 2)
+            
+            h_len = min(original_h, curr_h)
+            w_len = min(original_w, curr_w)
+            
+            try:
+                canvas[:, :, dst_y:dst_y+h_len, dst_x:dst_x+w_len] = \
+                    w_rescaled[:, :, src_y:src_y+h_len, src_x:src_x+w_len]
+            except: 
+                continue
+
+            # --- Geometric Transform: Shift ---
+            for dy in range(-shift_range, shift_range + 1):
+                for dx in range(-shift_range, shift_range + 1):
+                    w_shifted = torch.roll(canvas, shifts=(dy, dx), dims=(2, 3))
+                    
+                    # 测速优化：使用 reshape(-1) 避免多余的内存拷贝
+                    w_flat = w_shifted.reshape(-1).numpy()
+                    
+                    # --- Robust Decoding ---
+                    decoded_bits, confidence = self.attempt_decode(w_flat)
+                    
+                    if confidence > best_confidence:
+                        best_confidence = confidence
+                        
+        return best_confidence
+
+    def benchmark_sync(self, dummy_w, n_repeat=200, n_warmup=20):
+        """
+        系统级延迟测试：预热 + 多次重复 + 强制单线程稳定测试
+        """
+        print("\n>>> [Benchmark] Preparing strict CPU timing environment...")
+        # 强制单线程，消除多线程调度带来的耗时波动
+        torch.set_num_threads(1)
+        torch.set_num_interop_threads(1)
+        
+        # 确保 tensor 在 CPU 上，并且是 float 类型
+        target_tensor = dummy_w.cpu().float()
+        
+        print(f">>> [Benchmark] Warming up for {n_warmup} iterations (ignoring cache overhead)...")
+        for _ in range(n_warmup):
+            self._sync_only(target_tensor)
+            
+        print(f">>> [Benchmark] Running formal benchmark for {n_repeat} iterations...")
+        times = []
+        for _ in range(n_repeat):
+            t0 = time.perf_counter()
+            self._sync_only(target_tensor)
+            t1 = time.perf_counter()
+            times.append((t1 - t0) * 1000.0) # 转换为毫秒 (ms)
+            
+        mean_time = np.mean(times)
+        std_time = np.std(times)
+        p95_time = np.percentile(times, 95)
+        
+        print("\n" + "="*50)
+        print("🚀 Synchronization Benchmark Results (CPU)")
+        print("="*50)
+        print(f"Mean Time : {mean_time:.2f} ms")
+        print(f"Std Dev   : {std_time:.2f} ms")
+        print(f"P95 Time  : {p95_time:.2f} ms")
+        print("="*50)
+        
+        return mean_time, std_time, p95_time
 
     def get_tpr(self):
         return self.tp_onebit_count, self.tp_bits_count

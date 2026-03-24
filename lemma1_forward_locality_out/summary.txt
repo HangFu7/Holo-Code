@@ -1,0 +1,10 @@
+=== Forward locality summary ===
+Trials: 20
+Latent shape: (1, 4, 64, 64)
+Image size: 512
+Downsample factor: 8
+Patch size (latent): 8x8
+Epsilon: 0.08
+ECR mean ± std: 0.032136 ± 0.033963
+Area fraction mean ± std: 0.015625 ± 0.000000
+ECR - area_fraction (mean): 0.016511
